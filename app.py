@@ -111,7 +111,6 @@ def _normaliza_colunas(df: pd.DataFrame) -> pd.DataFrame:
         if subs_col is not None:
             g["subsistema"] = g[subs_col].astype(str).str.strip().str.upper()
         else:
-            # se realmente não houver nada de subsistema, deixa para cair no erro de missing
             g["subsistema"] = pd.NA
 
         # Valor numérico em MWmed
@@ -248,6 +247,10 @@ df_f = df[df["subsistema"].isin(sel_subs)].copy()
 start, end = pd.to_datetime(sel_range[0]), pd.to_datetime(sel_range[1])
 df_f = df_f[(df_f["data"] >= start) & (df_f["data"] <= end)]
 
+if df_f.empty:
+    st.warning("Não há dados para o filtro selecionado. Ajuste subsistemas ou período.")
+    st.stop()
+
 # KPIs do último mês disponível por subsistema
 last_month = df_f["data"].max()
 df_last = df_f[df_f["data"] == last_month].copy()
@@ -353,6 +356,107 @@ fig_heat = px.imshow(
     color_continuous_scale="Viridis",
 )
 st.plotly_chart(fig_heat, use_container_width=True, theme="streamlit")
+
+# ========= Novas análises =========
+
+st.divider()
+colC, colD = st.columns(2)
+
+# 1) Perfil sazonal médio
+with colC:
+    st.subheader("Perfil sazonal médio por subsistema")
+    season = df_f.copy()
+    season["mes_num"] = season["data"].dt.month
+    season_mean = (season
+                   .groupby(["subsistema", "mes_num"], as_index=False)["energia_gwh"]
+                   .mean())
+    fig_season = px.line(
+        season_mean,
+        x="mes_num", y="energia_gwh", color="subsistema",
+        markers=True,
+        labels={"mes_num": "Mês", "energia_gwh": "GWh/mês (média histórica)", "subsistema": "Subsistema"},
+        title=None
+    )
+    st.plotly_chart(fig_season, use_container_width=True, theme="streamlit")
+
+# 2) Distribuição da variação YoY
+with colD:
+    st.subheader("Distribuição da variação anual (YoY)")
+    df_yoy_valid = df_yoy.dropna(subset=["yoy_%"])
+    if df_yoy_valid.empty:
+        st.info("Não há janelas suficientes para calcular YoY com o período selecionado.")
+    else:
+        fig_yoy_box = px.box(
+            df_yoy_valid,
+            x="subsistema", y="yoy_%", points="outliers",
+            labels={"subsistema": "Subsistema", "yoy_%": "YoY (%)"},
+            title=None
+        )
+        st.plotly_chart(fig_yoy_box, use_container_width=True, theme="streamlit")
+
+st.divider()
+
+# 3) Correlação entre subsistemas
+st.subheader("Correlação entre subsistemas (carga mensal)")
+corr_pivot = (df_f
+              .pivot_table(index="data", columns="subsistema", values="energia_gwh", aggfunc="sum"))
+# Se só tiver um subsistema selecionado, não dá para calcular correlação
+if corr_pivot.shape[1] < 2:
+    st.info("Selecione pelo menos dois subsistemas para visualizar correlações.")
+else:
+    corr_mat = corr_pivot.corr()
+    fig_corr = px.imshow(
+        corr_mat,
+        x=corr_mat.columns,
+        y=corr_mat.index,
+        labels=dict(x="Subsistema", y="Subsistema", color="Correlação"),
+        zmin=-1, zmax=1,
+        aspect="auto"
+    )
+    st.plotly_chart(fig_corr, use_container_width=True, theme="streamlit")
+
+st.divider()
+colE, colF = st.columns(2)
+
+# 4) Volatilidade x nível de carga
+with colE:
+    st.subheader("Volatilidade x nível de carga (últimos 24 meses)")
+    window_24 = df_f[df_f["data"] >= (df_f["data"].max() - pd.DateOffset(months=24))]
+    stats_vol = (window_24
+                 .groupby("subsistema")["energia_gwh"]
+                 .agg(["mean", "std"])
+                 .reset_index()
+                 .rename(columns={"mean": "gwh_medio", "std": "gwh_std"}))
+    if stats_vol.empty:
+        st.info("Período selecionado é muito curto para calcular volatilidade em 24 meses.")
+    else:
+        fig_vol = px.scatter(
+            stats_vol,
+            x="gwh_medio", y="gwh_std", text="subsistema",
+            labels={
+                "gwh_medio": "GWh/mês (média, 24m)",
+                "gwh_std": "Desvio padrão (GWh/mês, 24m)"
+            },
+            title=None
+        )
+        fig_vol.update_traces(textposition="top center")
+        st.plotly_chart(fig_vol, use_container_width=True, theme="streamlit")
+
+# 5) Top 5 meses de maior carga por subsistema
+with colF:
+    st.subheader("Top 5 meses de maior carga por subsistema")
+    top5 = (df_f
+            .sort_values("energia_gwh", ascending=False)
+            .groupby("subsistema")
+            .head(5)
+            .sort_values(["subsistema", "energia_gwh"], ascending=[True, False]))
+    top5_view = top5[["subsistema", "data", "energia_gwh"]].copy()
+    top5_view["data"] = top5_view["data"].dt.strftime("%Y-%m")
+    top5_view["energia_gwh"] = top5_view["energia_gwh"].round(1)
+    st.dataframe(
+        top5_view.rename(columns={"subsistema": "Subsistema", "data": "Mês", "energia_gwh": "GWh/mês"}),
+        use_container_width=True
+    )
 
 # Exportar CSV filtrado
 if btn_download:
