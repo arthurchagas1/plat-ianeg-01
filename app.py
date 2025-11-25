@@ -76,28 +76,70 @@ def _try_read_csv(content: bytes) -> pd.DataFrame:
         raise RuntimeError(f"Não foi possível ler o CSV: {e}")
 
 def _normaliza_colunas(df: pd.DataFrame) -> pd.DataFrame:
-    """Padroniza nomes de colunas prováveis -> ano, mes, subsistema, carga_mwmed."""
-    cols = {c: c.strip() for c in df.columns}
-    df = df.rename(columns=cols)
-    low = {c: c.lower() for c in df.columns}
-    df = df.rename(columns=low)
+    """
+    Padroniza nomes de colunas prováveis -> ano, mes, subsistema, carga_mwmed.
 
+    Suporta tanto esquemas "antigos" (colunas já separadas de ano/mes/subsistema/carga)
+    quanto o esquema oficial mais recente do ONS para Carga de Energia Mensal, com
+    colunas como:
+      - id_subsistema / nom_subsistema
+      - din_instante (YYYY-MM-DD HH:MM:SS)
+      - val_cargaenergiamwmed
+    """
+    # limpeza básica de nomes: tirar espaços e jogar tudo para minúsculas
+    df = df.rename(columns=lambda c: c.strip())
+    df = df.rename(columns=lambda c: c.lower())
+
+    cols = set(df.columns)
+
+    # ----- Caso 1: novo layout oficial (din_instante + val_cargaenergiamwmed) -----
+    if "din_instante" in cols and "val_cargaenergiamwmed" in cols:
+        g = df.copy()
+
+        # datetime de referência mensal
+        g["din_instante"] = pd.to_datetime(g["din_instante"], errors="coerce")
+        g["ano"] = g["din_instante"].dt.year.astype("Int64")
+        g["mes"] = g["din_instante"].dt.month.astype("Int64")
+
+        # Subsistema: preferir o nome legível; se não tiver, usar o id
+        subs_col = None
+        if "nom_subsistema" in cols:
+            subs_col = "nom_subsistema"
+        elif "id_subsistema" in cols:
+            subs_col = "id_subsistema"
+
+        if subs_col is not None:
+            g["subsistema"] = g[subs_col].astype(str).str.strip().str.upper()
+        else:
+            # se realmente não houver nada de subsistema, deixa para cair no erro de missing
+            g["subsistema"] = pd.NA
+
+        # Valor numérico em MWmed
+        g["carga_mwmed"] = pd.to_numeric(g["val_cargaenergiamwmed"], errors="coerce")
+
+        # Filtrar linhas válidas
+        g = g.dropna(subset=["ano", "mes", "subsistema", "carga_mwmed"])
+        g = g[(g["mes"] >= 1) & (g["mes"] <= 12)]
+        return g
+
+    # ----- Caso 2: layouts antigos/alternativos (heurística genérica) -----
     def _contains(col: str, keys: List[str]) -> bool:
         c = col.lower()
         return any(k in c for k in keys)
 
-    # mapear colunas
     ano_col = next((c for c in df.columns if _contains(c, ["ano", "year"])), None)
     mes_col = next((c for c in df.columns if _contains(c, ["mes", "mês", "month"])), None)
     subs_col = next((c for c in df.columns if _contains(c, ["subsistema", "subsis", "subsystem"])), None)
 
-    # carga (MWmed) pode vir como "carga", "valor", "mwmed"
-    carga_candidates = [c for c in df.columns if _contains(c, ["carga", "mwmed", "valor", "mw_medio", "mwmedio"])]
+    # carga (MWmed) pode vir como "carga", "valor", "mwmed" etc.
+    carga_candidates = [
+        c for c in df.columns if _contains(c, ["carga", "mwmed", "valor", "mw_medio", "mwmedio"])
+    ]
     # priorizar colunas numéricas
     cand_num = [c for c in carga_candidates if pd.api.types.is_numeric_dtype(df[c])]
     carga_col = cand_num[0] if cand_num else (carga_candidates[0] if carga_candidates else None)
 
-    rename_map = {}
+    rename_map: Dict[str, str] = {}
     if ano_col:
         rename_map[ano_col] = "ano"
     if mes_col:
@@ -111,7 +153,10 @@ def _normaliza_colunas(df: pd.DataFrame) -> pd.DataFrame:
 
     missing = [c for c in ["ano", "mes", "subsistema", "carga_mwmed"] if c not in df.columns]
     if missing:
-        raise ValueError(f"Colunas essenciais ausentes após normalização: {missing}")
+        raise ValueError(
+            "Colunas essenciais ausentes após normalização: "
+            f"{missing}. Colunas disponíveis no CSV: {sorted(df.columns.tolist())}"
+        )
 
     # tipos
     df["ano"] = pd.to_numeric(df["ano"], errors="coerce").astype("Int64")
