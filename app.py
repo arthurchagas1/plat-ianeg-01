@@ -16,7 +16,13 @@ import requests
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
+
+# NEW: forecasting
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+import warnings
+warnings.filterwarnings("ignore")
 
 # ========= Config do App =========
 st.set_page_config(
@@ -56,19 +62,16 @@ def _hours_in_month(year: int, month: int) -> int:
 
 def _try_read_csv(content: bytes) -> pd.DataFrame:
     """Tenta ler CSV com separador autodetectado e fallback em ; e ,."""
-    # 1) tentativa: sep=None (sniff), engine='python'
     bio = io.BytesIO(content)
     try:
         return pd.read_csv(bio, sep=None, engine="python", encoding="utf-8")
     except Exception:
         pass
-    # 2) sep=';'
     bio.seek(0)
     try:
         return pd.read_csv(bio, sep=";", encoding="utf-8")
     except Exception:
         pass
-    # 3) sep=','
     bio.seek(0)
     try:
         return pd.read_csv(bio, sep=",", encoding="utf-8")
@@ -86,42 +89,25 @@ def _normaliza_colunas(df: pd.DataFrame) -> pd.DataFrame:
       - din_instante (YYYY-MM-DD HH:MM:SS)
       - val_cargaenergiamwmed
     """
-    # limpeza básica de nomes: tirar espaços e jogar tudo para minúsculas
-    df = df.rename(columns=lambda c: c.strip())
-    df = df.rename(columns=lambda c: c.lower())
-
+    df = df.rename(columns=lambda c: c.strip()).rename(columns=lambda c: c.lower())
     cols = set(df.columns)
 
-    # ----- Caso 1: novo layout oficial (din_instante + val_cargaenergiamwmed) -----
+    # Caso 1: layout oficial novo
     if "din_instante" in cols and "val_cargaenergiamwmed" in cols:
         g = df.copy()
-
-        # datetime de referência mensal
         g["din_instante"] = pd.to_datetime(g["din_instante"], errors="coerce")
         g["ano"] = g["din_instante"].dt.year.astype("Int64")
         g["mes"] = g["din_instante"].dt.month.astype("Int64")
 
-        # Subsistema: preferir o nome legível; se não tiver, usar o id
-        subs_col = None
-        if "nom_subsistema" in cols:
-            subs_col = "nom_subsistema"
-        elif "id_subsistema" in cols:
-            subs_col = "id_subsistema"
-
-        if subs_col is not None:
-            g["subsistema"] = g[subs_col].astype(str).str.strip().str.upper()
-        else:
-            g["subsistema"] = pd.NA
-
-        # Valor numérico em MWmed
+        subs_col = "nom_subsistema" if "nom_subsistema" in cols else ("id_subsistema" if "id_subsistema" in cols else None)
+        g["subsistema"] = g[subs_col].astype(str).str.strip().str.upper() if subs_col else pd.NA
         g["carga_mwmed"] = pd.to_numeric(g["val_cargaenergiamwmed"], errors="coerce")
 
-        # Filtrar linhas válidas
         g = g.dropna(subset=["ano", "mes", "subsistema", "carga_mwmed"])
         g = g[(g["mes"] >= 1) & (g["mes"] <= 12)]
         return g
 
-    # ----- Caso 2: layouts antigos/alternativos (heurística genérica) -----
+    # Caso 2: heurística
     def _contains(col: str, keys: List[str]) -> bool:
         c = col.lower()
         return any(k in c for k in keys)
@@ -129,25 +115,15 @@ def _normaliza_colunas(df: pd.DataFrame) -> pd.DataFrame:
     ano_col = next((c for c in df.columns if _contains(c, ["ano", "year"])), None)
     mes_col = next((c for c in df.columns if _contains(c, ["mes", "mês", "month"])), None)
     subs_col = next((c for c in df.columns if _contains(c, ["subsistema", "subsis", "subsystem"])), None)
-
-    # carga (MWmed) pode vir como "carga", "valor", "mwmed" etc.
-    carga_candidates = [
-        c for c in df.columns if _contains(c, ["carga", "mwmed", "valor", "mw_medio", "mwmedio"])
-    ]
-    # priorizar colunas numéricas
+    carga_candidates = [c for c in df.columns if _contains(c, ["carga", "mwmed", "valor", "mw_medio", "mwmedio"])]
     cand_num = [c for c in carga_candidates if pd.api.types.is_numeric_dtype(df[c])]
     carga_col = cand_num[0] if cand_num else (carga_candidates[0] if carga_candidates else None)
 
     rename_map: Dict[str, str] = {}
-    if ano_col:
-        rename_map[ano_col] = "ano"
-    if mes_col:
-        rename_map[mes_col] = "mes"
-    if subs_col:
-        rename_map[subs_col] = "subsistema"
-    if carga_col:
-        rename_map[carga_col] = "carga_mwmed"
-
+    if ano_col: rename_map[ano_col] = "ano"
+    if mes_col: rename_map[mes_col] = "mes"
+    if subs_col: rename_map[subs_col] = "subsistema"
+    if carga_col: rename_map[carga_col] = "carga_mwmed"
     df = df.rename(columns=rename_map)
 
     missing = [c for c in ["ano", "mes", "subsistema", "carga_mwmed"] if c not in df.columns]
@@ -157,14 +133,11 @@ def _normaliza_colunas(df: pd.DataFrame) -> pd.DataFrame:
             f"{missing}. Colunas disponíveis no CSV: {sorted(df.columns.tolist())}"
         )
 
-    # tipos
     df["ano"] = pd.to_numeric(df["ano"], errors="coerce").astype("Int64")
     df["mes"] = pd.to_numeric(df["mes"], errors="coerce").astype("Int64")
     df["carga_mwmed"] = pd.to_numeric(df["carga_mwmed"], errors="coerce")
-    # limpar subsistema
     df["subsistema"] = df["subsistema"].astype(str).str.strip().str.upper()
 
-    # remover linhas inválidas
     df = df.dropna(subset=["ano", "mes", "subsistema", "carga_mwmed"])
     df = df[(df["mes"] >= 1) & (df["mes"] <= 12)]
     return df
@@ -201,6 +174,82 @@ def rolling_ma(group: pd.DataFrame, value_col: str = "energia_gwh", window: int 
     g = group.sort_values("data").copy()
     g[f"ma{window}"] = g[value_col].rolling(window=window, min_periods=1).mean()
     return g
+
+# ========= Forecasting helpers =========
+def _prepare_monthly_series(df_sub: pd.DataFrame) -> pd.Series:
+    """Cria série mensal contínua (MS) de energia_gwh para o subsistema."""
+    s = (df_sub.set_index("data")["energia_gwh"]
+                 .sort_index()
+                 .resample("MS").sum())  # já é mensal; sum preserva valores únicos
+    # preencher pequenos buracos (se houver) para modelos exigirem continuidade
+    if s.isna().any():
+        s = s.interpolate(limit_direction="both")
+    return s
+
+def _seasonal_naive_forecast(s: pd.Series, horizon: int) -> pd.Series:
+    """Repete o valor do mesmo mês do ano anterior."""
+    if len(s) >= 12:
+        last12 = s[-12:].values
+        reps = int(math.ceil(horizon / 12))
+        future_vals = np.tile(last12, reps)[:horizon]
+        future_index = pd.date_range(s.index[-1] + pd.offsets.MonthBegin(1), periods=horizon, freq="MS")
+        return pd.Series(future_vals, index=future_index)
+    else:
+        # fallback para ingênuo simples
+        future_index = pd.date_range(s.index[-1] + pd.offsets.MonthBegin(1), periods=horizon, freq="MS")
+        return pd.Series([s.iloc[-1]] * horizon, index=future_index)
+
+def _residual_sigma(actual: pd.Series, fitted: pd.Series) -> float:
+    res = (actual - fitted).dropna()
+    if len(res) < 3:
+        return float(np.std(actual.diff().dropna())) if len(actual) > 3 else 0.0
+    return float(res.std(ddof=1))
+
+@st.cache_data(ttl=6 * 3600)
+def prever_subsistema(df_base: pd.DataFrame, subs: str, horizon: int, use_filtered_range: bool) -> pd.DataFrame:
+    """
+    Treina ETS aditivo (sazonalidade 12) ou fallback e retorna DataFrame com:
+    ['subsistema','data','yhat','yhat_lower','yhat_upper','metodo']
+    """
+    df_sub = df_base[df_base["subsistema"] == subs][["data", "energia_gwh"]].copy()
+    s = _prepare_monthly_series(df_sub)
+
+    metodo = "ETS(aditivo, saz=12)"
+    try:
+        if len(s) >= 24:  # pelo menos 2 ciclos para ajustar sazonalidade
+            model = ExponentialSmoothing(
+                s, trend="add", seasonal="add", seasonal_periods=12,
+                initialization_method="estimated"
+            ).fit(optimized=True, use_brute=False)
+            fc_vals = model.forecast(horizon)
+            sigma = _residual_sigma(s, model.fittedvalues)
+        else:
+            metodo = "Sazonal ingênuo" if len(s) >= 12 else "Ingênuo"
+            fc_vals = _seasonal_naive_forecast(s, horizon)
+            # estimar sigma pelos resíduos sazonais (ou diffs)
+            if metodo == "Sazonal ingênuo" and len(s) > 24:
+                res = (s[12:] - s.shift(12)[12:]).dropna()
+                sigma = float(res.std(ddof=1))
+            else:
+                sigma = float(s.diff().dropna().std(ddof=1)) if len(s) > 3 else 0.0
+    except Exception:
+        metodo = "Fallback sazonal ingênuo"
+        fc_vals = _seasonal_naive_forecast(s, horizon)
+        sigma = float(s.diff().dropna().std(ddof=1)) if len(s) > 3 else 0.0
+
+    z = 1.96  # ~95%
+    lower = np.maximum(0.0, fc_vals.values - z * sigma)
+    upper = fc_vals.values + z * sigma
+
+    df_fc = pd.DataFrame({
+        "subsistema": subs,
+        "data": fc_vals.index,
+        "yhat": fc_vals.values,
+        "yhat_lower": lower,
+        "yhat_upper": upper,
+        "metodo": metodo
+    })
+    return df_fc
 
 # ========= UI =========
 st.title("⚡ Monitor de Energia por Subsistema — Brasil (ONS)")
@@ -241,6 +290,13 @@ with st.sidebar:
     st.divider()
     st.caption("Exportar os dados filtrados")
     btn_download = st.button("Gerar CSV filtrado para download")
+
+    st.divider()
+    st.header("🔮 Previsão")
+    enable_fc = st.checkbox("Ativar previsão", value=True)
+    horizon = st.slider("Horizonte (meses)", min_value=6, max_value=24, value=12, step=1)
+    use_filtered_range = st.checkbox("Treinar com o período filtrado acima", value=True)
+    st.caption("Modelo: Holt-Winters (ETS aditivo, sazonalidade 12). Se a série for curta, aplica um ingênuo sazonal.")
 
 # aplicar filtros
 df_f = df[df["subsistema"].isin(sel_subs)].copy()
@@ -299,7 +355,6 @@ with col1:
 
 with col2:
     st.subheader("Área empilhada — participação")
-    # normalizar participação por mês
     share = (df_f
              .groupby(["data", "subsistema"], as_index=False)["energia_gwh"].sum())
     fig_area = px.area(
@@ -320,7 +375,6 @@ colA, colB = st.columns(2)
 
 with colA:
     st.subheader("Ranking (média dos últimos 12 meses)")
-    # média 12m por subsistema (janela dentro do filtro)
     last12 = df_f[df_f["data"] >= (df_f["data"].max() - pd.DateOffset(months=12))]
     rank = (last12.groupby("subsistema", as_index=False)["energia_gwh"]
             .mean().rename(columns={"energia_gwh": "gwh_12m_media"}))
@@ -342,12 +396,92 @@ with colB:
     )
     st.plotly_chart(fig_yoy, use_container_width=True, theme="streamlit")
 
+# ========= NOVA SEÇÃO: Tendência e Previsão =========
+if enable_fc:
+    st.divider()
+    st.subheader("📈 Tendência e Previsão (GWh/mês)")
+
+    # base para treinamento da previsão
+    df_train_base = df_f if use_filtered_range else df[df["subsistema"].isin(sel_subs)]
+
+    # paleta consistente por subsistema
+    palette = px.colors.qualitative.Plotly
+    color_map = {s: palette[i % len(palette)] for i, s in enumerate(sel_subs)}
+
+    fig_fc = go.Figure()
+    all_fc_rows = []
+
+    # histórico por subsistema
+    for i, subs in enumerate(sel_subs):
+        hist = (df_f[df_f["subsistema"] == subs]
+                .sort_values("data")[["data", "energia_gwh"]])
+        fig_fc.add_trace(go.Scatter(
+            x=hist["data"], y=hist["energia_gwh"],
+            mode="lines",
+            name=f"{subs} — histórico",
+            legendgroup=subs, line=dict(color=color_map[subs])
+        ))
+
+        # previsão
+        df_fc = prever_subsistema(df_train_base, subs, horizon, use_filtered_range)
+        all_fc_rows.append(df_fc)
+
+        # faixa de incerteza
+        fig_fc.add_trace(go.Scatter(
+            x=pd.concat([df_fc["data"], df_fc["data"][::-1]]),
+            y=pd.concat([df_fc["yhat_upper"], df_fc["yhat_lower"][::-1]]),
+            fill="toself",
+            fillcolor="rgba(0,0,0,0.08)",
+            line=dict(color="rgba(0,0,0,0)"),
+            hoverinfo="skip",
+            showlegend=True if i == 0 else False,
+            name="IC 95%"
+        ))
+
+        # linha da previsão
+        fig_fc.add_trace(go.Scatter(
+            x=df_fc["data"], y=df_fc["yhat"],
+            mode="lines",
+            name=f"{subs} — previsão",
+            legendgroup=subs,
+            line=dict(color=color_map[subs], dash="dash")
+        ))
+
+    fig_fc.update_layout(
+        xaxis_title="Data",
+        yaxis_title="GWh/mês",
+        hovermode="x unified"
+    )
+    st.plotly_chart(fig_fc, use_container_width=True, theme="streamlit")
+
+    # tabela de previsões
+    df_fc_all = pd.concat(all_fc_rows, ignore_index=True)
+    st.caption("Tabela de previsões (valores médios e intervalos ~95%).")
+    tbl = df_fc_all.copy()
+    tbl["data"] = tbl["data"].dt.strftime("%Y-%m")
+    tbl = (tbl[["subsistema", "data", "yhat", "yhat_lower", "yhat_upper", "metodo"]]
+           .rename(columns={
+               "subsistema": "Subsistema",
+               "data": "Mês",
+               "yhat": "Prev (GWh/mês)",
+               "yhat_lower": "Inf 95%",
+               "yhat_upper": "Sup 95%",
+               "metodo": "Método"
+           }))
+    st.dataframe(tbl, use_container_width=True)
+
+    fc_csv = df_fc_all.sort_values(["subsistema", "data"]).to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="⬇️ Baixar CSV de previsões",
+        data=fc_csv,
+        file_name=f"ons_previsoes_{dt.datetime.now():%Y%m%d-%H%M%S}.csv",
+        mime="text/csv"
+    )
+
 st.divider()
 st.subheader("Heatmap — intensidade mensal (GWh)")
-# pivot p/ heatmap (subsistemas nas colunas, meses no eixo x)
 heat = (df_f.pivot_table(index="subsistema", columns="data", values="energia_gwh", aggfunc="sum")
         .sort_index())
-# para evitar NaN no heatmap
 heat = heat.fillna(0.0)
 fig_heat = px.imshow(
     heat,
@@ -358,7 +492,6 @@ fig_heat = px.imshow(
 st.plotly_chart(fig_heat, use_container_width=True, theme="streamlit")
 
 # ========= Novas análises =========
-
 st.divider()
 colC, colD = st.columns(2)
 
@@ -400,7 +533,6 @@ st.divider()
 st.subheader("Correlação entre subsistemas (carga mensal)")
 corr_pivot = (df_f
               .pivot_table(index="data", columns="subsistema", values="energia_gwh", aggfunc="sum"))
-# Se só tiver um subsistema selecionado, não dá para calcular correlação
 if corr_pivot.shape[1] < 2:
     st.info("Selecione pelo menos dois subsistemas para visualizar correlações.")
 else:
